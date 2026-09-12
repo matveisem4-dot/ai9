@@ -1,0 +1,733 @@
+# NEURAL_NETWORK_TRAINING_CORPUS_FULL.md
+# Формат: Сводный текстовый датасет для предобучения (Pre-training) языковых моделей.
+
+===============================================================================
+[LANGUAGE: PYTHON]
+[DOMAIN: DEEP LEARNING / TRANSFORMER ARCHITECTURE]
+===============================================================================
+import math
+import torch
+import torch.nn as nn
+from torch.nn import functional as F
+
+class NewGELU(nn.Module):
+    """
+    Реализация функции активации GELU, используемая в моделях OpenAI GPT.
+    """
+    def forward(self, x):
+        return 0.5 * x * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * torch.pow(x, 3.0))))
+
+class CausalSelfAttention(nn.Module):
+    """
+    Полноценный механизм Causal Multi-Head Self-Attention.
+    """
+    def __init__(self, config):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.attn_dropout = nn.Dropout(config.attn_pdrop)
+        self.resid_dropout = nn.Dropout(config.resid_pdrop)
+        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+                                     .view(1, 1, config.block_size, config.block_size))
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+
+    def forward(self, x):
+        B, T, C = x.size()
+        qkv = self.c_attn(x)
+        q, k, v = qkv.split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
+        att = F.softmax(att, dim=-1)
+        att = self.attn_dropout(att)
+        
+        y = att @ v
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        y = self.resid_dropout(self.c_proj(y))
+        return y
+
+class Block(nn.Module):
+    """
+    Блок трансформера: Коммуникация (Attention) + Вычисление (FeedForward).
+    """
+    def __init__(self, config):
+        super().__init__()
+        self.ln_1 = nn.LayerNorm(config.n_embd)
+        self.attn = CausalSelfAttention(config)
+        self.ln_2 = nn.LayerNorm(config.n_embd)
+        self.mlp = nn.ModuleDict(dict(
+            c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd),
+            c_proj  = nn.Linear(4 * config.n_embd, config.n_embd),
+            act     = NewGELU(),
+            dropout = nn.Dropout(config.resid_pdrop),
+        ))
+        m = self.mlp
+        self.mlpf = lambda x: m.dropout(m.c_proj(m.act(m.c_fc(x))))
+
+    def forward(self, x):
+        x = x + self.attn(self.ln_1(x))
+        x = x + self.mlpf(self.ln_2(x))
+        return x
+
+class GPT(nn.Module):
+    """
+    Полная модель генерации текста (GPT).
+    """
+    def __init__(self, config):
+        super().__init__()
+        self.block_size = config.block_size
+        self.transformer = nn.ModuleDict(dict(
+            wte = nn.Embedding(config.vocab_size, config.n_embd),
+            wpe = nn.Embedding(config.block_size, config.n_embd),
+            drop = nn.Dropout(config.embd_pdrop),
+            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            ln_f = nn.LayerNorm(config.n_embd),
+        ))
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.apply(self._init_weights)
+        for pn, p in self.named_parameters():
+            if pn.endswith('c_proj.weight'):
+                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        elif isinstance(module, nn.LayerNorm):
+            torch.nn.init.zeros_(module.bias)
+            torch.nn.init.ones_(module.weight)
+
+    def forward(self, idx, targets=None):
+        device = idx.device
+        b, t = idx.size()
+        pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0)
+        
+        tok_emb = self.transformer.wte(idx)
+        pos_emb = self.transformer.wpe(pos)
+        x = self.transformer.drop(tok_emb + pos_emb)
+        for block in self.transformer.h:
+            x = block(x)
+        x = self.transformer.ln_f(x)
+        logits = self.lm_head(x)
+        
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+        return logits, loss
+
+class GPTConfig:
+    vocab_size = 50257
+    block_size = 1024
+    n_layer = 12
+    n_head = 12
+    n_embd = 768
+    embd_pdrop = 0.1
+    resid_pdrop = 0.1
+    attn_pdrop = 0.1
+
+
+===============================================================================
+[LANGUAGE: C]
+[DOMAIN: SYSTEM PROGRAMMING / MULTITHREADED HTTP SERVER]
+===============================================================================
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <pthread.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+
+#define PORT 8080
+#define BUFFER_SIZE 4096
+#define THREAD_POOL_SIZE 10
+
+pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t queue_cond = PTHREAD_COND_INITIALIZER;
+int client_queue[100];
+int queue_head = 0;
+int queue_tail = 0;
+int queue_count = 0;
+
+void enqueue(int client_socket) {
+    pthread_mutex_lock(&queue_mutex);
+    client_queue[queue_tail] = client_socket;
+    queue_tail = (queue_tail + 1) % 100;
+    queue_count++;
+    pthread_cond_signal(&queue_cond);
+    pthread_mutex_unlock(&queue_mutex);
+}
+
+int dequeue() {
+    pthread_mutex_lock(&queue_mutex);
+    while (queue_count == 0) {
+        pthread_cond_wait(&queue_cond, &queue_mutex);
+    }
+    int client_socket = client_queue[queue_head];
+    queue_head = (queue_head + 1) % 100;
+    queue_count--;
+    pthread_mutex_unlock(&queue_mutex);
+    return client_socket;
+}
+
+void handle_client(int client_socket) {
+    char buffer[BUFFER_SIZE];
+    ssize_t bytes_read = read(client_socket, buffer, BUFFER_SIZE - 1);
+    
+    if (bytes_read > 0) {
+        buffer[bytes_read] = '\0';
+        char method[16], path[256], protocol[16];
+        sscanf(buffer, "%15s %255s %15s", method, path, protocol);
+        
+        if (strcmp(method, "GET") == 0) {
+            const char *response_header = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n";
+            const char *response_body = "<html><body><h1>Hello from High-Performance C Server!</h1><p>Multithreading is working.</p></body></html>";
+            
+            write(client_socket, response_header, strlen(response_header));
+            write(client_socket, response_body, strlen(response_body));
+        } else {
+            const char *error_response = "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            write(client_socket, error_response, strlen(error_response));
+        }
+    }
+    close(client_socket);
+}
+
+void *worker_thread(void *arg) {
+    while (1) {
+        int client_socket = dequeue();
+        handle_client(client_socket);
+    }
+    return NULL;
+}
+
+int main() {
+    int server_socket;
+    struct sockaddr_in server_addr;
+
+    server_socket = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_socket == -1) {
+        perror("Socket creation failed");
+        exit(EXIT_FAILURE);
+    }
+
+    int opt = 1;
+    if (setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) {
+        perror("Setsockopt failed");
+        exit(EXIT_FAILURE);
+    }
+
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = INADDR_ANY;
+    server_addr.sin_port = htons(PORT);
+
+    if (bind(server_socket, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        perror("Bind failed");
+        exit(EXIT_FAILURE);
+    }
+
+    if (listen(server_socket, 10) < 0) {
+        perror("Listen failed");
+        exit(EXIT_FAILURE);
+    }
+
+    pthread_t threads[THREAD_POOL_SIZE];
+    for (int i = 0; i < THREAD_POOL_SIZE; i++) {
+        pthread_create(&threads[i], NULL, worker_thread, NULL);
+    }
+
+    printf("Server listening on port %d\n", PORT);
+
+    while (1) {
+        struct sockaddr_in client_addr;
+        socklen_t client_len = sizeof(client_addr);
+        int client_socket = accept(server_socket, (struct sockaddr *)&client_addr, &client_len);
+        
+        if (client_socket < 0) {
+            perror("Accept failed");
+            continue;
+        }
+        enqueue(client_socket);
+    }
+    
+    close(server_socket);
+    return 0;
+}
+
+
+===============================================================================
+[LANGUAGE: HTML/CSS/JAVASCRIPT]
+[DOMAIN: FRONTEND / FULLY PLAYABLE BROWSER TETRIS IN ONE FILE]
+===============================================================================
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Vanilla JS Tetris</title>
+    <style>
+        body {
+            background-color: #202028;
+            color: #fff;
+            font-family: sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+            overflow: hidden;
+        }
+        #game-container {
+            display: flex;
+            gap: 20px;
+        }
+        canvas {
+            border: solid 2px #fff;
+            background-color: #000;
+        }
+        #score-board {
+            display: flex;
+            flex-direction: column;
+            justify-content: flex-start;
+            font-size: 24px;
+        }
+    </style>
+</head>
+<body>
+    <div id="game-container">
+        <canvas id="tetris" width="240" height="400"></canvas>
+        <div id="score-board">
+            <div>Score: <span id="score">0</span></div>
+            <p style="font-size: 14px; color: #888;">Controls:<br>Arrow keys to move<br>Up to rotate<br>Down to drop</p>
+        </div>
+    </div>
+
+    <script>
+        const canvas = document.getElementById('tetris');
+        const context = canvas.getContext('2d');
+        context.scale(20, 20); // 1 unit = 20 pixels
+
+        function arenaSweep() {
+            let rowCount = 1;
+            outer: for (let y = arena.length - 1; y > 0; --y) {
+                for (let x = 0; x < arena[y].length; ++x) {
+                    if (arena[y][x] === 0) continue outer;
+                }
+                const row = arena.splice(y, 1)[0].fill(0);
+                arena.unshift(row);
+                ++y;
+                player.score += rowCount * 10;
+                rowCount *= 2;
+            }
+        }
+
+        function collide(arena, player) {
+            const m = player.matrix;
+            const o = player.pos;
+            for (let y = 0; y < m.length; ++y) {
+                for (let x = 0; x < m[y].length; ++x) {
+                    if (m[y][x] !== 0 &&
+                       (arena[y + o.y] && arena[y + o.y][x + o.x]) !== 0) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
+        function createMatrix(w, h) {
+            const matrix = [];
+            while (h--) {
+                matrix.push(new Array(w).fill(0));
+            }
+            return matrix;
+        }
+
+        function createPiece(type) {
+            if (type === 'T') {
+                return [ [0, 0, 0], [1, 1, 1], [0, 1, 0] ];
+            } else if (type === 'O') {
+                return [ [2, 2], [2, 2] ];
+            } else if (type === 'L') {
+                return [ [0, 3, 0], [0, 3, 0], [0, 3, 3] ];
+            } else if (type === 'J') {
+                return [ [0, 4, 0], [0, 4, 0], [4, 4, 0] ];
+            } else if (type === 'I') {
+                return [ [0, 5, 0, 0], [0, 5, 0, 0], [0, 5, 0, 0], [0, 5, 0, 0] ];
+            } else if (type === 'S') {
+                return [ [0, 6, 6], [6, 6, 0], [0, 0, 0] ];
+            } else if (type === 'Z') {
+                return [ [7, 7, 0], [0, 7, 7], [0, 0, 0] ];
+            }
+        }
+
+        function drawMatrix(matrix, offset) {
+            matrix.forEach((row, y) => {
+                row.forEach((value, x) => {
+                    if (value !== 0) {
+                        context.fillStyle = colors[value];
+                        context.fillRect(x + offset.x, y + offset.y, 1, 1);
+                    }
+                });
+            });
+        }
+
+        function draw() {
+            context.fillStyle = '#000';
+            context.fillRect(0, 0, canvas.width, canvas.height);
+            drawMatrix(arena, {x: 0, y: 0});
+            drawMatrix(player.matrix, player.pos);
+        }
+
+        function merge(arena, player) {
+            player.matrix.forEach((row, y) => {
+                row.forEach((value, x) => {
+                    if (value !== 0) {
+                        arena[y + player.pos.y][x + player.pos.x] = value;
+                    }
+                });
+            });
+        }
+
+        function playerDrop() {
+            player.pos.y++;
+            if (collide(arena, player)) {
+                player.pos.y--;
+                merge(arena, player);
+                playerReset();
+                arenaSweep();
+                updateScore();
+            }
+            dropCounter = 0;
+        }
+
+        function playerMove(dir) {
+            player.pos.x += dir;
+            if (collide(arena, player)) {
+                player.pos.x -= dir;
+            }
+        }
+
+        function playerReset() {
+            const pieces = 'ILJOTSZ';
+            player.matrix = createPiece(pieces[pieces.length * Math.random() | 0]);
+            player.pos.y = 0;
+            player.pos.x = (arena[0].length / 2 | 0) - (player.matrix[0].length / 2 | 0);
+            if (collide(arena, player)) {
+                arena.forEach(row => row.fill(0));
+                player.score = 0;
+                updateScore();
+            }
+        }
+
+        function playerRotate(dir) {
+            const pos = player.pos.x;
+            let offset = 1;
+            rotate(player.matrix, dir);
+            while (collide(arena, player)) {
+                player.pos.x += offset;
+                offset = -(offset + (offset > 0 ? 1 : -1));
+                if (offset > player.matrix[0].length) {
+                    rotate(player.matrix, -dir);
+                    player.pos.x = pos;
+                    return;
+                }
+            }
+        }
+
+        function rotate(matrix, dir) {
+            for (let y = 0; y < matrix.length; ++y) {
+                for (let x = 0; x < y; ++x) {
+                    [ matrix[x][y], matrix[y][x] ] = [ matrix[y][x], matrix[x][y] ];
+                }
+            }
+            if (dir > 0) {
+                matrix.forEach(row => row.reverse());
+            } else {
+                matrix.reverse();
+            }
+        }
+
+        let dropCounter = 0;
+        let dropInterval = 1000;
+        let lastTime = 0;
+
+        function update(time = 0) {
+            const deltaTime = time - lastTime;
+            lastTime = time;
+            dropCounter += deltaTime;
+            if (dropCounter > dropInterval) {
+                playerDrop();
+            }
+            draw();
+            requestAnimationFrame(update);
+        }
+
+        function updateScore() {
+            document.getElementById('score').innerText = player.score;
+        }
+
+        const colors = [ null, '#FF0D72', '#0DC2FF', '#0DFF72', '#F538FF', '#FF8E0D', '#FFE138', '#3877FF' ];
+        const arena = createMatrix(12, 20);
+        const player = { pos: {x: 0, y: 0}, matrix: null, score: 0 };
+
+        document.addEventListener('keydown', event => {
+            if (event.keyCode === 37) { playerMove(-1); }
+            else if (event.keyCode === 39) { playerMove(1); }
+            else if (event.keyCode === 40) { playerDrop(); }
+            else if (event.keyCode === 38) { playerRotate(1); }
+        });
+
+        playerReset();
+        updateScore();
+        update();
+    </script>
+</body>
+</html>
+
+
+===============================================================================
+[LANGUAGE: GO]
+[DOMAIN: DISTRIBUTED SYSTEMS / BLOCKCHAIN NODE LOGIC]
+===============================================================================
+package main
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"strconv"
+	"time"
+)
+
+type Block struct {
+	Index        int
+	Timestamp    int64
+	Transactions []Transaction
+	PreviousHash string
+	Hash         string
+	Nonce        int
+}
+
+type Transaction struct {
+	Sender    string
+	Recipient string
+	Amount    float64
+}
+
+type Blockchain struct {
+	Chain               []Block
+	CurrentTransactions []Transaction
+}
+
+func (bc *Blockchain) CreateBlock(nonce int, previousHash string) Block {
+	block := Block{
+		Index:        len(bc.Chain) + 1,
+		Timestamp:    time.Now().Unix(),
+		Transactions: bc.CurrentTransactions,
+		PreviousHash: previousHash,
+		Nonce:        nonce,
+	}
+
+	block.Hash = bc.Hash(block)
+	bc.CurrentTransactions = nil
+	bc.Chain = append(bc.Chain, block)
+	return block
+}
+
+func (bc *Blockchain) AddTransaction(sender, recipient string, amount float64) int {
+	bc.CurrentTransactions = append(bc.CurrentTransactions, Transaction{
+		Sender:    sender,
+		Recipient: recipient,
+		Amount:    amount,
+	})
+	return bc.LastBlock().Index + 1
+}
+
+func (bc *Blockchain) LastBlock() Block {
+	return bc.Chain[len(bc.Chain)-1]
+}
+
+func (bc *Blockchain) Hash(block Block) string {
+	blockString, _ := json.Marshal(block)
+	hash := sha256.Sum256(blockString)
+	return hex.EncodeToString(hash[:])
+}
+
+func (bc *Blockchain) ProofOfWork(lastNonce int) int {
+	nonce := 0
+	for !bc.ValidProof(lastNonce, nonce) {
+		nonce++
+	}
+	return nonce
+}
+
+func (bc *Blockchain) ValidProof(lastNonce, nonce int) bool {
+	guess := []byte(strconv.Itoa(lastNonce) + strconv.Itoa(nonce))
+	guessHash := sha256.Sum256(guess)
+	return hex.EncodeToString(guessHash[:])[:4] == "0000"
+}
+
+func main() {
+	bc := Blockchain{}
+	
+	// Генерируем Genesis блок
+	bc.CreateBlock(100, "1")
+
+	http.HandleFunc("/mine", func(w http.ResponseWriter, r *http.Request) {
+		lastBlock := bc.LastBlock()
+		lastNonce := lastBlock.Nonce
+
+		nonce := bc.ProofOfWork(lastNonce)
+
+		// Награда за майнинг (0 значит система)
+		bc.AddTransaction("0", "node_address", 1)
+
+		previousHash := bc.Hash(lastBlock)
+		block := bc.CreateBlock(nonce, previousHash)
+
+		response := struct {
+			Message      string
+			Index        int
+			Transactions []Transaction
+			Nonce        int
+			PreviousHash string
+		}{
+			Message:      "New Block Forged",
+			Index:        block.Index,
+			Transactions: block.Transactions,
+			Nonce:        block.Nonce,
+			PreviousHash: block.PreviousHash,
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(response)
+	})
+
+	http.HandleFunc("/transactions/new", func(w http.ResponseWriter, r *http.Request) {
+		var t Transaction
+		if err := json.NewDecoder(r.Body).Decode(&t); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		index := bc.AddTransaction(t.Sender, t.Recipient, t.Amount)
+		response := map[string]string{"message": fmt.Sprintf("Transaction will be added to Block %d", index)}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(response)
+	})
+
+	http.HandleFunc("/chain", func(w http.ResponseWriter, r *http.Request) {
+		response := struct {
+			Chain  []Block
+			Length int
+		}{
+			Chain:  bc.Chain,
+			Length: len(bc.Chain),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(response)
+	})
+
+	fmt.Println("Blockchain Node running on port 5000")
+	http.ListenAndServe(":5000", nil)
+}
+
+
+===============================================================================
+[LANGUAGE: SQL]
+[DOMAIN: DATABASE ARCHITECTURE / E-COMMERCE SCHEMA & PROCEDURES]
+===============================================================================
+CREATE DATABASE ECommerceDB;
+\c ECommerceDB;
+
+CREATE TABLE Users (
+    user_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    email VARCHAR(255) UNIQUE NOT NULL,
+    password_hash VARCHAR(255) NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    is_active BOOLEAN DEFAULT TRUE
+);
+
+CREATE TABLE Categories (
+    category_id SERIAL PRIMARY KEY,
+    name VARCHAR(100) NOT NULL,
+    parent_category_id INT REFERENCES Categories(category_id) ON DELETE SET NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE Products (
+    product_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    category_id INT REFERENCES Categories(category_id),
+    name VARCHAR(255) NOT NULL,
+    description TEXT,
+    price DECIMAL(10, 2) NOT NULL CHECK (price >= 0),
+    stock_quantity INT NOT NULL CHECK (stock_quantity >= 0),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE Orders (
+    order_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID REFERENCES Users(user_id) ON DELETE CASCADE,
+    total_amount DECIMAL(10, 2) NOT NULL DEFAULT 0.00,
+    status VARCHAR(50) DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'PAID', 'SHIPPED', 'COMPLETED', 'CANCELLED')),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE OrderItems (
+    order_item_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    order_id UUID REFERENCES Orders(order_id) ON DELETE CASCADE,
+    product_id UUID REFERENCES Products(product_id),
+    quantity INT NOT NULL CHECK (quantity > 0),
+    unit_price DECIMAL(10, 2) NOT NULL,
+    subtotal DECIMAL(10, 2) GENERATED ALWAYS AS (quantity * unit_price) STORED
+);
+
+CREATE INDEX idx_products_category ON Products(category_id);
+CREATE INDEX idx_orders_user ON Orders(user_id);
+CREATE INDEX idx_orderitems_order ON OrderItems(order_id);
+
+CREATE OR REPLACE PROCEDURE ProcessOrderPayment(
+    p_order_id UUID,
+    p_payment_status BOOLEAN
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_current_status VARCHAR(50);
+BEGIN
+    SELECT status INTO v_current_status FROM Orders WHERE order_id = p_order_id FOR UPDATE;
+    
+    IF v_current_status != 'PENDING' THEN
+        RAISE EXCEPTION 'Order is not in PENDING status. Current status: %', v_current_status;
+    END IF;
+
+    IF p_payment_status = TRUE THEN
+        UPDATE Orders SET status = 'PAID', updated_at = CURRENT_TIMESTAMP WHERE order_id = p_order_id;
+        
+        -- Списание остатков со склада
+        UPDATE Products p
+        SET stock_quantity = p.stock_quantity - oi.quantity
+        FROM OrderItems oi
+        WHERE p.product_id = oi.product_id AND oi.order_id = p_order_id;
+        
+        COMMIT;
+    ELSE
+        UPDATE Orders SET status = 'CANCELLED', updated_at = CURRENT_TIMESTAMP WHERE order_id = p_order_id;
+        COMMIT;
+    END IF;
+END;
+$$;
